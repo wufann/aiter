@@ -711,7 +711,7 @@ def _get_config(
 
     if M < 32:
         BLK_M = triton.next_power_of_2(M)
-        if BLK_M >= 16 and hasattr(_get_config._config_dict[key], "small_M16"):
+        if BLK_M >= 16 and "small_M16" in _get_config._config_dict[key]:
             return _get_config._config_dict[key]["small_M16"]
         return _get_config._config_dict[key]["small"]
     elif M <= 128:

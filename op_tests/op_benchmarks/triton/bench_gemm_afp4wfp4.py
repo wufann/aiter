@@ -6,6 +6,7 @@ import math
 from aiter.ops.triton.gemm_afp4wfp4 import (
     gemm_afp4wfp4,
     gemm_afp4wfp4_preshuffled_scales,
+    gemm_afp4wfp4_preshuffled_weight_scales,
 )
 from op_tests.triton_tests.test_gemm_afp4wfp4 import generate_gemm_afp4wfp4_inputs
 from op_tests.op_benchmarks.triton.utils.argparse import (
@@ -28,7 +29,7 @@ TRITON_HIP_PRESHUFFLE_SCALES = (
 def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str, shuffle: bool):
     c_dtype = torch.bfloat16
     x, _, w, _, _, x_scale, w_scale, _, y = generate_gemm_afp4wfp4_inputs(
-        M, N, K, c_dtype, layout=layout, output=True, shuffle=shuffle
+        M, N, K, c_dtype, layout=layout, output=True, shuffle_scales_fg=shuffle, shuffle_weight_fg=shuffle
     )
     # flops
     flops = 2.0 * M * N * K
@@ -41,20 +42,8 @@ def bench_gemm_fn(M: int, N: int, K: int, metric: str, layout: str, shuffle: boo
     mem_write = (M * N) * 2  # TODO: Fix for c_dtype != bf16
     mem = mem_read + mem_write
     if shuffle:
-        # config={
-        #     'BLOCK_SIZE_M': 32,
-        #     'BLOCK_SIZE_N': 64,
-        #     'BLOCK_SIZE_K': 256,
-        #     'GROUP_SIZE_M': 4,
-        #     'num_warps': 2,
-        #     'num_stages': 2,
-        #     'waves_per_eu': 1,
-        #     'matrix_instr_nonkdim': 16,
-        #     'cache_modifier': None,
-        #     'NUM_KSPLIT': 1,
-        # }
         ms = triton.testing.do_bench(
-            lambda: gemm_afp4wfp4_preshuffled_scales(
+            lambda: gemm_afp4wfp4_preshuffled_weight_scales(
                 x, w, x_scale, w_scale, c_dtype, y#, config=config
             ),
             warmup=25,
