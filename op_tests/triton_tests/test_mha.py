@@ -164,7 +164,10 @@ def test_mha(
     v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
 
     dropout_mask = None
+
+    # Version split
     if version == "v3":
+        # V3 path
         if FP8:
             if DROPOUT > 0.0 or RETURN_LSE or RETURN_SOFTMAX:
                 pytest.skip(
@@ -188,7 +191,6 @@ def test_mha(
                 v_descale=v_descale,
             )
         else:
-            # Non-FP8 v3 path (no dropout/lse/attn_probs support parity check)
             if DROPOUT > 0.0 or RETURN_LSE or RETURN_SOFTMAX:
                 pytest.skip(
                     "flash_attn_func_v3 (non-FP8) doesn't expose dropout/lse/attn_probs here"
@@ -200,9 +202,29 @@ def test_mha(
                 softmax_scale=None,
                 causal=CAUSAL,
             )
-    else:  # v2
+
+        if DEBUG_MODE:
+            print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
+
+        torch_out = attention_ref(
+            q, k, v, dropout_p=0.0, dropout_mask=None, causal=CAUSAL
+        )
+        torch_out, attention_scores, _ = torch_out
+        if DEBUG_MODE:
+            print(f"torch_out.shape={torch_out.shape}, torch_out={torch_out}")
+            print(
+                f"attention_scores.shape={attention_scores.shape}, attention_scores={attention_scores}"
+            )
+
+        if FP8:
+            fp8_assert_close(triton_out, torch_out, atol=ATOL_fp8, rtol=RTOL_fp8)
+        else:
+            torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
+
+    else:  # V2 path
         if FP8:
             pytest.skip("FP8 supported only on version 'v3'")
+
         triton_out = flash_attn_func(
             q,
             k,
@@ -213,44 +235,42 @@ def test_mha(
             return_attn_probs=RETURN_SOFTMAX,
         )
 
-    if version == "v2" and RETURN_LSE:
-        assert len(triton_out) > 1
-        lse = triton_out[1]
-        if DEBUG_MODE:
-            print(f"lse.shape={lse.shape}, lse={lse}")
-
-    if version == "v2" and DROPOUT > 0.0 and RETURN_SOFTMAX:
         if RETURN_LSE:
-            assert len(triton_out) == 3
-            sd_mask = triton_out[2]
-        else:
-            assert len(triton_out) == 2
-            sd_mask = triton_out[1]
-        dropout_mask = sd_mask >= 0
+            assert len(triton_out) > 1
+            lse = triton_out[1]
+            if DEBUG_MODE:
+                print(f"lse.shape={lse.shape}, lse={lse}")
+
+        if DROPOUT > 0.0 and RETURN_SOFTMAX:
+            if RETURN_LSE:
+                assert len(triton_out) == 3
+                sd_mask = triton_out[2]
+            else:
+                assert len(triton_out) == 2
+                sd_mask = triton_out[1]
+            dropout_mask = sd_mask >= 0
+            if DEBUG_MODE:
+                print(f"sd_mask.shape={sd_mask.shape}, sd_mask={sd_mask}")
+                print(
+                    f"dropout_mask.shape={dropout_mask.shape}, dropout_mask={dropout_mask}"
+                )
+
+        if RETURN_SOFTMAX or RETURN_LSE:
+            triton_out = triton_out[0]
+
         if DEBUG_MODE:
-            print(f"sd_mask.shape={sd_mask.shape}, sd_mask={sd_mask}")
+            print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
+
+        torch_out = attention_ref(
+            q, k, v, dropout_p=DROPOUT, dropout_mask=dropout_mask, causal=CAUSAL
+        )
+        torch_out, attention_scores, _ = torch_out
+        if DEBUG_MODE:
+            print(f"torch_out.shape={torch_out.shape}, torch_out={torch_out}")
             print(
-                f"dropout_mask.shape={dropout_mask.shape}, dropout_mask={dropout_mask}"
+                f"attention_scores.shape={attention_scores.shape}, attention_scores={attention_scores}"
             )
 
-    if version == "v2" and (RETURN_SOFTMAX or RETURN_LSE):
-        triton_out = triton_out[0]
-    if DEBUG_MODE:
-        print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
-
-    torch_out = attention_ref(
-        q, k, v, dropout_p=DROPOUT, dropout_mask=dropout_mask, causal=CAUSAL
-    )
-    torch_out, attention_scores, _ = torch_out
-    if DEBUG_MODE:
-        print(f"torch_out.shape={torch_out.shape}, torch_out={torch_out}")
-        print(
-            f"attention_scores.shape={attention_scores.shape}, attention_scores={attention_scores}"
-        )
-
-    if FP8:
-        fp8_assert_close(triton_out, torch_out, atol=ATOL_fp8, rtol=RTOL_fp8)
-    else:
         torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
 
 
@@ -430,7 +450,12 @@ def test_mha_varlen(
         print(f"max_seqlens_k={max_seqlen_k }")
         print(f"cu_seqlens_q={cu_seqlens_q }")
         print(f"cu_seqlens_k={cu_seqlens_k }")
+
+    dropout_mask = None
+
+    # Version split
     if version == "v3":
+        # V3 path
         if FP8:
             if DROPOUT > 0.0 or RETURN_LSE or RETURN_SOFTMAX:
                 pytest.skip(
@@ -475,9 +500,42 @@ def test_mha_varlen(
                 softmax_scale=None,
                 causal=CAUSAL,
             )
-    else:
+
+        triton_out = output_pad_fn(triton_out)
+        if DEBUG_MODE:
+            print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
+
+        torch_out = attention_ref(
+            q,
+            k,
+            v,
+            query_padding_mask=query_padding_mask,
+            key_padding_mask=key_padding_mask,
+            dropout_p=0.0,
+            dropout_mask=None,
+            causal=CAUSAL,
+        )
+        torch_out, attention_scores, _ = torch_out
+
+        if DEBUG_MODE:
+            print(f"torch_out.shape={torch_out.shape}, torch_out={torch_out}")
+            print(
+                f"attention_scores.shape={attention_scores.shape}, attention_scores={attention_scores}"
+            )
+
+        if FP8:
+            fp8_assert_close(
+                triton_out, torch_out, atol=0.25, rtol=10
+            )  # Lower tolerance for FP8
+        else:
+            torch.testing.assert_close(
+                triton_out, torch_out.to(triton_out.dtype), atol=1e-1, rtol=1e-1
+            )
+
+    else:  # V2 path
         if FP8:
             pytest.skip("FP8 supported only on version 'v3'")
+
         triton_out = flash_attn_varlen_func(
             q_unpad,
             k_unpad,
@@ -492,43 +550,43 @@ def test_mha_varlen(
             return_attn_probs=RETURN_SOFTMAX,
         )
 
-    if version == "v2" and RETURN_LSE:
-        assert len(triton_out) > 1
-        lse = triton_out[1]
-        if DEBUG_MODE:
-            print(f"lse.shape={lse.shape}, lse={lse}")
-
-    dropout_mask = None
-    if version == "v2" and DROPOUT > 0.0 and RETURN_SOFTMAX:
         if RETURN_LSE:
-            assert len(triton_out) == 3
-            sd_mask = triton_out[2]
-        else:
-            assert len(triton_out) == 2
-            sd_mask = triton_out[1]
-        dropout_mask = sd_mask >= 0
-        dropout_mask = pad_rearrange_dropout_mask(
-            dropout_mask,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            SEQLEN_Q,
-            SEQLEN_K,
-            NUM_Q_HEADS,
-        )
-        dropout_mask = dropout_mask > 0
-        if DEBUG_MODE:
-            # print(f"sd_mask.shape={sd_mask.shape}, sd_mask={sd_mask}")
-            print(
-                f"dropout_mask.shape={dropout_mask.shape}, dropout_mask={dropout_mask}"
+            assert len(triton_out) > 1
+            lse = triton_out[1]
+            if DEBUG_MODE:
+                print(f"lse.shape={lse.shape}, lse={lse}")
+
+        if DROPOUT > 0.0 and RETURN_SOFTMAX:
+            if RETURN_LSE:
+                assert len(triton_out) == 3
+                sd_mask = triton_out[2]
+            else:
+                assert len(triton_out) == 2
+                sd_mask = triton_out[1]
+            dropout_mask = sd_mask >= 0
+            dropout_mask = pad_rearrange_dropout_mask(
+                dropout_mask,
+                cu_seqlens_q,
+                cu_seqlens_k,
+                max_seqlen_q,
+                max_seqlen_k,
+                SEQLEN_Q,
+                SEQLEN_K,
+                NUM_Q_HEADS,
             )
-    if version == "v2" and (RETURN_SOFTMAX or RETURN_LSE):
-        triton_out = output_pad_fn(triton_out[0])
-    else:
-        triton_out = output_pad_fn(triton_out)
-    if DEBUG_MODE:
-        print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
+            dropout_mask = dropout_mask > 0
+            if DEBUG_MODE:
+                print(
+                    f"dropout_mask.shape={dropout_mask.shape}, dropout_mask={dropout_mask}"
+                )
+
+        if RETURN_SOFTMAX or RETURN_LSE:
+            triton_out = output_pad_fn(triton_out[0])
+        else:
+            triton_out = output_pad_fn(triton_out)
+
+        if DEBUG_MODE:
+            print(f"triton_out.shape={triton_out.shape}, triton_out={triton_out}")
 
     torch_out = attention_ref(
         q,
@@ -548,14 +606,9 @@ def test_mha_varlen(
             f"attention_scores.shape={attention_scores.shape}, attention_scores={attention_scores}"
         )
 
-    if FP8:
-        fp8_assert_close(
-            triton_out, torch_out, atol=0.25, rtol=10
-        )  # Lower tolerance for FP8
-    else:
-        torch.testing.assert_close(
-            triton_out, torch_out.to(triton_out.dtype), atol=1e-1, rtol=1e-1
-        )
+    torch.testing.assert_close(
+        triton_out, torch_out.to(triton_out.dtype), atol=1e-1, rtol=1e-1
+    )
 
 
 @pytest.mark.parametrize("version", ["v2", "v3"])
@@ -645,6 +698,44 @@ def test_mha_backward(
                 triton_dq, triton_dk, triton_dv = torch.autograd.grad(
                     triton_out, (q, k, v), do.clone()
                 )
+
+        if DEBUG_MODE:
+            print("--------------Triton (post)----------------")
+            print(f"triton_out.shape={triton_out.shape}")
+            print(
+                f"dq/dk/dv shapes: {triton_dq.shape} {triton_dk.shape} {triton_dv.shape}"
+            )
+
+        # Reference backward (always PyTorch attention_ref)
+        with torch.enable_grad():
+            torch_out = attention_ref(
+                q,
+                k,
+                v,
+                dropout_p=0.0,
+                dropout_mask=None,
+                causal=CAUSAL,
+            )
+        torch_out, attention_scores, _ = torch_out
+
+        torch_dq, torch_dk, torch_dv = torch.autograd.grad(torch_out, (q, k, v), do)
+
+        if DEBUG_MODE:
+            print("--------------Torch (post)----------------")
+            print(f"torch_out.shape={torch_out.shape}")
+
+        # Assertions
+        if FP8:
+            fp8_assert_close(triton_out, torch_out, atol=ATOL_fp8, rtol=RTOL_fp8)
+            fp8_assert_close(triton_dq, torch_dq, atol=ATOL_fp8, rtol=RTOL_fp8)
+            fp8_assert_close(triton_dk, torch_dk, atol=ATOL_fp8, rtol=RTOL_fp8)
+            fp8_assert_close(triton_dv, torch_dv, atol=ATOL_fp8, rtol=RTOL_fp8)
+        else:
+            torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
+            torch.testing.assert_close(triton_dq, torch_dq, atol=1e-2, rtol=1e-2)
+            torch.testing.assert_close(triton_dk, torch_dk, atol=1e-2, rtol=1e-2)
+            torch.testing.assert_close(triton_dv, torch_dv, atol=1e-2, rtol=1e-2)
+
     else:  # version == 'v2'
         pytest.skip("V2 Backward has accuracy issues")
         if FUSED and CAUSAL:
@@ -688,41 +779,24 @@ def test_mha_backward(
         )
     torch_out, attention_scores, _ = torch_out
 
-    torch.testing.assert_close(
-        triton_out, torch_out.to(triton_out.dtype), atol=1e-2, rtol=1e-2
-    )
-
     torch_dq, torch_dk, torch_dv = torch.autograd.grad(torch_out, (q, k, v), do)
 
     if DEBUG_MODE:
         print("--------------Torch (post)----------------")
         print(f"torch_out.shape={torch_out.shape}")
 
-    # Assertions
-    if version == "v3":
-        if FP8:
-            fp8_assert_close(triton_out, torch_out, atol=ATOL_fp8, rtol=RTOL_fp8)
-            fp8_assert_close(triton_dq, torch_dq, atol=ATOL_fp8, rtol=RTOL_fp8)
-            fp8_assert_close(triton_dk, torch_dk, atol=ATOL_fp8, rtol=RTOL_fp8)
-            fp8_assert_close(triton_dv, torch_dv, atol=ATOL_fp8, rtol=RTOL_fp8)
-        else:
-            torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
-            torch.testing.assert_close(triton_dq, torch_dq, atol=1e-2, rtol=1e-2)
-            torch.testing.assert_close(triton_dk, torch_dk, atol=1e-2, rtol=1e-2)
-            torch.testing.assert_close(triton_dv, torch_dv, atol=1e-2, rtol=1e-2)
-    else:  # v2 assertions
-        torch.testing.assert_close(
-            triton_out, torch_out.to(triton_out.dtype), atol=1e-2, rtol=1e-2
-        )
-        torch.testing.assert_close(
-            triton_dq, torch_dq.to(triton_out.dtype), atol=1e-2, rtol=1e-2
-        )
-        torch.testing.assert_close(
-            triton_dk, torch_dk.to(triton_out.dtype), atol=1e-2, rtol=1e-2
-        )
-        torch.testing.assert_close(
-            triton_dv, torch_dv.to(triton_out.dtype), atol=1e-2, rtol=1e-2
-        )
+    torch.testing.assert_close(
+        triton_out, torch_out.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        triton_dq, torch_dq.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        triton_dk, torch_dk.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        triton_dv, torch_dv.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+    )
 
 
 @pytest.mark.parametrize("version", ["v2", "v3"])
@@ -970,31 +1044,22 @@ def test_mha_backward_varlen(
         )
     torch_out, attention_scores, _ = torch_out
 
-    if version == "v3" and FP8:
-        fp8_assert_close(triton_out, torch_out, atol=ATOL_fp8, rtol=RTOL_fp8)
-    else:
-        torch.testing.assert_close(
-            triton_out, torch_out.to(triton_out.dtype), atol=1e-2, rtol=1e-2
-        )
-
     # backward reference
     torch_dq, torch_dk, torch_dv = torch.autograd.grad(torch_out, (q, k, v), do)
 
     # Assertions
-    if version == "v3" and FP8:
-        fp8_assert_close(triton_dq, torch_dq, atol=ATOL_fp8, rtol=RTOL_fp8)
-        fp8_assert_close(triton_dk, torch_dk, atol=ATOL_fp8, rtol=RTOL_fp8)
-        fp8_assert_close(triton_dv, torch_dv, atol=ATOL_fp8, rtol=RTOL_fp8)
-    else:
-        torch.testing.assert_close(
-            triton_dq, torch_dq.to(triton_out.dtype), atol=1e-2, rtol=1e-2
-        )
-        torch.testing.assert_close(
-            triton_dk, torch_dk.to(triton_out.dtype), atol=1e-2, rtol=1e-2
-        )
-        torch.testing.assert_close(
-            triton_dv, torch_dv.to(triton_out.dtype), atol=1e-2, rtol=1e-2
-        )
+    torch.testing.assert_close(
+        triton_out, torch_out.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        triton_dq, torch_dq.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        triton_dk, torch_dk.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        triton_dv, torch_dv.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+    )
 
 
 @pytest.mark.parametrize("version", ["v2", "v3"])
@@ -1166,6 +1231,16 @@ def test_mha_kvcache(
             v_descale=v_descale,
             page_table=page_table,
         )
+
+        assert out_kernel.shape == out_ref.shape
+        # Accuracy assertion with FP8-aware tolerances
+        if FP8:
+            fp8_assert_close(out_kernel, out_ref, atol=ATOL_fp8, rtol=RTOL_fp8)
+        else:
+            torch.testing.assert_close(
+                out_kernel, out_ref.to(out_kernel.dtype), atol=1e-2, rtol=1e-2
+            )
+
     else:  # v2 path
         if FP8:
             pytest.skip(
@@ -1182,11 +1257,7 @@ def test_mha_kvcache(
             return_softmax_lse=False,
         )
 
-    assert out_kernel.shape == out_ref.shape
-    # Accuracy assertion with FP8-aware tolerances
-    if FP8:
-        fp8_assert_close(out_kernel, out_ref, atol=ATOL_fp8, rtol=RTOL_fp8)
-    else:
+        assert out_kernel.shape == out_ref.shape
         torch.testing.assert_close(
             out_kernel, out_ref.to(out_kernel.dtype), atol=1e-2, rtol=1e-2
         )
