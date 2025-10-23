@@ -5,9 +5,12 @@ from typing import Optional, Dict
 import torch
 import triton  # type: ignore
 import triton.language as tl  # type: ignore
-from aiter.ops.triton.utils.types import _is_fp8
-from aiter.ops.triton.utils.logger import AiterTritonLogger
 
+import jax
+import jax.numpy as jnp
+import jax_triton as jt
+
+from aiter.ops.triton.utils.logger import AiterTritonLogger
 from aiter.ops.triton._triton_kernels.mha_onekernel_bwd import (
     _bwd_preprocess,
     bwd_kernel_causal,
@@ -47,10 +50,6 @@ def flash_attn_onekernel_backward(
     dropout_p: float,
     philox_seed: Optional[int] = 0,
     philox_offset: Optional[int] = 0,
-    descale_q: Optional[torch.Tensor] = None,
-    descale_k: Optional[torch.Tensor] = None,
-    descale_v: Optional[torch.Tensor] = None,
-    descale_do: Optional[torch.Tensor] = None,
     USE_INT64_STRIDES: Optional[bool] = False,
     config: Optional[Dict[str, any]] = None,
 ):
@@ -64,27 +63,6 @@ def flash_attn_onekernel_backward(
     use_alibi, (stride_az, stride_ah) = (
         (True, alibi_slopes.stride()) if alibi_slopes is not None else (False, (0, 0))
     )
-
-    IS_FP8 = _is_fp8(q)
-    if IS_FP8:
-        FP8_MAX = torch.finfo(q.dtype).max
-        descale_strides = (
-            descale_q.stride(0),
-            descale_k.stride(0),
-            descale_v.stride(0),
-            descale_do.stride(0),
-        )
-    else:
-        FP8_MAX = None
-        stride_descale_q_z = stride_descale_k_z = stride_descale_v_z = (
-            stride_descale_do_z
-        ) = None
-        descale_strides = (
-            stride_descale_q_z,
-            stride_descale_k_z,
-            stride_descale_v_z,
-            stride_descale_do_z,
-        )
 
     IS_VARLEN = True if cu_seqlens_q is not None else False
 
@@ -159,7 +137,6 @@ def flash_attn_onekernel_backward(
         BLOCK_D_MODEL=head_sz,
         BLOCK_D_MODEL_POW2=BLOCK_D_MODEL_POW2,
         IS_VARLEN=IS_VARLEN,
-        IS_FP8=IS_FP8,
     )
 
     # dropout_mask
@@ -219,19 +196,12 @@ def flash_attn_onekernel_backward(
             philox_seed,
             philox_offset,
             alibi_slopes,
-            descale_q,
-            descale_k,
-            descale_v,
-            descale_do,
             HEAD_DIM=head_sz,
             ACTUAL_HEAD_DIM=BLOCK_D_MODEL_POW2,
             ENABLE_DROPOUT=use_dropout,
             IS_VARLEN=IS_VARLEN,
             USE_ALIBI=use_alibi,
             USE_EXP2=True,
-            IS_FP8=IS_FP8,
-            FP8_MAX=FP8_MAX,
-            FP8_OUTPUT=False,
             DEBUG_TRITON=False,
             DEBUG_TRITON_DETAIL=False,
             USE_INT64_STRIDES=USE_INT64_STRIDES,
@@ -272,19 +242,12 @@ def flash_attn_onekernel_backward(
             philox_seed,
             philox_offset,
             alibi_slopes,
-            descale_q,
-            descale_k,
-            descale_v,
-            descale_do,
             HEAD_DIM=head_sz,
             ACTUAL_HEAD_DIM=BLOCK_D_MODEL_POW2,
             ENABLE_DROPOUT=use_dropout,
             IS_VARLEN=IS_VARLEN,
             USE_ALIBI=use_alibi,
             USE_EXP2=True,
-            IS_FP8=IS_FP8,
-            FP8_MAX=FP8_MAX,
-            FP8_OUTPUT=False,
             DEBUG_TRITON=False,
             DEBUG_TRITON_DETAIL=False,
             USE_INT64_STRIDES=USE_INT64_STRIDES,

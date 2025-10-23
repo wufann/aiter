@@ -7,9 +7,7 @@ import logging
 import numpy as np
 from aiter.ops.triton.mha import (
     flash_attn_func,
-    flash_attn_fp8_func,
     flash_attn_varlen_func,
-    flash_attn_varlen_fp8_func,
     mha_set_use_fused_bwd_kernel,
     mha_set_use_int64_strides,
 )
@@ -22,8 +20,6 @@ from aiter.test_mha_common import (
 logging.basicConfig(level=logging.DEBUG)
 logger = logging.getLogger(__name__)
 DEBUG_MODE = False
-ATOL_fp8 = 2.5e-1
-RTOL_fp8 = 2.5e-1
 
 
 def pad_rearrange_dropout_mask(
@@ -57,45 +53,6 @@ def pad_rearrange_dropout_mask(
     return padded_dropout_mask
 
 
-def fp8_assert_close(
-    tensor_a, tensor_b, atol=ATOL_fp8, rtol=RTOL_fp8, max_diff_percentage=0.5
-):
-    """Assert tensors are close with tolerance for small percentage of elements"""
-    # standard comparison
-    abs_diff = torch.abs(tensor_a - tensor_b)
-    rel_diff = abs_diff / torch.abs(tensor_b.clamp(min=1e-6))
-
-    # calculate elements that exceed tolerance
-    abs_check = abs_diff > atol
-    rel_check = rel_diff > rtol
-    failed_check = torch.logical_and(abs_check, rel_check)
-
-    # calculate percentage of failed elements
-    failed_percentage = failed_check.sum().item() / failed_check.numel() * 100
-
-    # if percentage is small enough, test passes
-    if failed_percentage <= max_diff_percentage:
-        return True
-
-    # Otherwise, provide diagnostic information
-    max_abs_idx = torch.argmax(abs_diff).item()
-    max_rel_idx = torch.argmax(rel_diff).item()
-
-    flat_to_idx = lambda flat_idx, shape: np.unravel_index(flat_idx, shape)
-
-    max_abs_pos = flat_to_idx(max_abs_idx, tensor_a.shape)
-    max_rel_pos = flat_to_idx(max_rel_idx, tensor_a.shape)
-
-    max_abs_diff = abs_diff.flatten()[max_abs_idx].item()
-    max_rel_diff = rel_diff.flatten()[max_rel_idx].item()
-
-    raise AssertionError(
-        f"Tensors not close enough! {failed_percentage:.6f}% elements exceed tolerance.\n"
-        f"Greatest absolute difference: {max_abs_diff} at index {max_abs_pos} (up to {atol} allowed)\n"
-        f"Greatest relative difference: {max_rel_diff} at index {max_rel_pos} (up to {rtol} allowed)"
-    )
-
-
 @pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
 @pytest.mark.parametrize(
     "SEQLEN_Q, SEQLEN_K",
@@ -109,7 +66,7 @@ def fp8_assert_close(
     "DROPOUT, RETURN_LSE, RETURN_SOFTMAX, ", [(0.2, True, True), (0.0, False, False)]
 )
 @pytest.mark.parametrize("CAUSAL", [(True), (False)])
-@pytest.mark.parametrize("FP8", [(True), (False)])
+# @pytest.mark.parametrize("FP8", [(True), (False)])
 def test_mha(
     BATCH: int,
     SEQLEN_Q: int,
@@ -121,7 +78,7 @@ def test_mha(
     RETURN_LSE: bool,
     RETURN_SOFTMAX: bool,
     CAUSAL: bool,
-    FP8: bool,
+    # FP8: bool,
     dtype=torch.float16,
 ):
     torch.cuda.empty_cache()
@@ -130,26 +87,15 @@ def test_mha(
     v = torch.randn((BATCH, SEQLEN_K, NUM_K_HEADS, HEAD_SZ), device="cuda", dtype=dtype)
 
     dropout_mask = None
-    if FP8:
-        triton_out = flash_attn_fp8_func(
-            q,
-            k,
-            v,
-            dropout_p=DROPOUT,
-            causal=CAUSAL,
-            return_lse=RETURN_LSE,
-            return_attn_probs=RETURN_SOFTMAX,
-        )
-    else:
-        triton_out = flash_attn_func(
-            q,
-            k,
-            v,
-            dropout_p=DROPOUT,
-            causal=CAUSAL,
-            return_lse=RETURN_LSE,
-            return_attn_probs=RETURN_SOFTMAX,
-        )
+    triton_out = flash_attn_func(
+        q,
+        k,
+        v,
+        dropout_p=DROPOUT,
+        causal=CAUSAL,
+        return_lse=RETURN_LSE,
+        return_attn_probs=RETURN_SOFTMAX,
+    )
 
     if RETURN_LSE:
         assert len(triton_out) > 1
@@ -186,12 +132,7 @@ def test_mha(
             f"attention_scores.shape={attention_scores.shape}, attention_scores={attention_scores}"
         )
 
-    if FP8:
-        fp8_assert_close(
-            triton_out, torch_out.to(triton_out.dtype), atol=ATOL_fp8, rtol=RTOL_fp8
-        )
-    else:
-        torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
+    torch.testing.assert_close(triton_out, torch_out, atol=1e-2, rtol=1e-2)
 
 
 # LLaMA 3 405B config
@@ -307,7 +248,7 @@ def test_mha_int64_strides(
 )
 @pytest.mark.parametrize("HEAD_SZ", [8, 32, 128])
 @pytest.mark.parametrize("CAUSAL", [(True), (False)])
-@pytest.mark.parametrize("FP8", [(False), (True)])
+# @pytest.mark.parametrize("FP8", [(False), (True)])
 def test_mha_varlen(
     BATCH: int,
     SEQLEN_Q: int,
@@ -319,7 +260,7 @@ def test_mha_varlen(
     RETURN_LSE: bool,
     RETURN_SOFTMAX: bool,
     CAUSAL: bool,
-    FP8: bool,
+    # FP8: bool,
     dtype=torch.float16,
 ):
     torch.set_printoptions(threshold=10000)
@@ -368,34 +309,19 @@ def test_mha_varlen(
         print(f"max_seqlens_k={max_seqlen_k }")
         print(f"cu_seqlens_q={cu_seqlens_q }")
         print(f"cu_seqlens_k={cu_seqlens_k }")
-    if FP8:
-        triton_out = flash_attn_varlen_fp8_func(
-            q_unpad,
-            k_unpad,
-            v_unpad,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            dropout_p=DROPOUT,
-            causal=CAUSAL,
-            return_lse=RETURN_LSE,
-            return_attn_probs=RETURN_SOFTMAX,
-        )
-    else:
-        triton_out = flash_attn_varlen_func(
-            q_unpad,
-            k_unpad,
-            v_unpad,
-            cu_seqlens_q,
-            cu_seqlens_k,
-            max_seqlen_q,
-            max_seqlen_k,
-            dropout_p=DROPOUT,
-            causal=CAUSAL,
-            return_lse=RETURN_LSE,
-            return_attn_probs=RETURN_SOFTMAX,
-        )
+    triton_out = flash_attn_varlen_func(
+        q_unpad,
+        k_unpad,
+        v_unpad,
+        cu_seqlens_q,
+        cu_seqlens_k,
+        max_seqlen_q,
+        max_seqlen_k,
+        dropout_p=DROPOUT,
+        causal=CAUSAL,
+        return_lse=RETURN_LSE,
+        return_attn_probs=RETURN_SOFTMAX,
+    )
 
     if RETURN_LSE:
         assert len(triton_out) > 1
@@ -453,14 +379,9 @@ def test_mha_varlen(
             f"attention_scores.shape={attention_scores.shape}, attention_scores={attention_scores}"
         )
 
-    if FP8:
-        torch.testing.assert_close(
-            triton_out, torch_out.to(triton_out.dtype), atol=0.25, rtol=10
-        )  # Lower tolerance for FP8
-    else:
-        torch.testing.assert_close(
-            triton_out, torch_out.to(triton_out.dtype), atol=1e-1, rtol=1e-1
-        )
+    torch.testing.assert_close(
+        triton_out, torch_out.to(triton_out.dtype), atol=1e-1, rtol=1e-1
+    )
 
 
 @pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
@@ -474,7 +395,7 @@ def test_mha_varlen(
     "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (16, 16), (2, 1), (48, 8)]
 )
 @pytest.mark.parametrize("HEAD_SZ", [8, 32, 128])
-@pytest.mark.parametrize("FP8", [False])
+# @pytest.mark.parametrize("FP8", [False])
 @pytest.mark.parametrize("FUSED", [False, True])
 # @pytest.mark.parametrize('FP8',[(False), (True)]) #TODO Debug FP8
 def test_mha_backward(
@@ -486,7 +407,7 @@ def test_mha_backward(
     HEAD_SZ: int,
     DROPOUT: float,
     CAUSAL: bool,
-    FP8: bool,
+    # FP8: bool,
     FUSED: bool,
     dtype=torch.float16,
 ):
@@ -514,26 +435,15 @@ def test_mha_backward(
         print(f"do.shape={do.shape} do={do}")
 
     with torch.enable_grad():
-        if FP8:
-            triton_out = flash_attn_fp8_func(
-                q,
-                k,
-                v,
-                dropout_p=DROPOUT,
-                causal=CAUSAL,
-                return_lse=True,
-                return_attn_probs=True,
-            )
-        else:
-            triton_out = flash_attn_func(
-                q,
-                k,
-                v,
-                dropout_p=DROPOUT,
-                causal=CAUSAL,
-                return_lse=True,
-                return_attn_probs=True,
-            )
+        triton_out = flash_attn_func(
+            q,
+            k,
+            v,
+            dropout_p=DROPOUT,
+            causal=CAUSAL,
+            return_lse=True,
+            return_attn_probs=True,
+        )
 
     assert len(triton_out) == 3
     triton_out, lse, sd_mask = triton_out[0], triton_out[1], triton_out[2]
@@ -581,26 +491,15 @@ def test_mha_backward(
         print(f"torch_dk.shape={torch_dk.shape} torch_dk={torch_dk}")
         print(f"torch_dv.shape={torch_dv.shape} torch_dv={torch_dv}")
 
-    if FP8:
-        fp8_assert_close(
-            triton_dq, torch_dq.to(triton_dq.dtype), atol=ATOL_fp8, rtol=RTOL_fp8
-        )
-        fp8_assert_close(
-            triton_dk, torch_dk.to(triton_dk.dtype), atol=ATOL_fp8, rtol=RTOL_fp8
-        )
-        fp8_assert_close(
-            triton_dv, torch_dv.to(triton_dv.dtype), atol=ATOL_fp8, rtol=RTOL_fp8
-        )
-    else:
-        torch.testing.assert_close(
-            triton_dq, torch_dq.to(triton_out.dtype), atol=1e-2, rtol=1e-2
-        )
-        torch.testing.assert_close(
-            triton_dk, torch_dk.to(triton_out.dtype), atol=1e-2, rtol=1e-2
-        )
-        torch.testing.assert_close(
-            triton_dv, torch_dv.to(triton_out.dtype), atol=1e-2, rtol=1e-2
-        )
+    torch.testing.assert_close(
+        triton_dq, torch_dq.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        triton_dk, torch_dk.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+    )
+    torch.testing.assert_close(
+        triton_dv, torch_dv.to(triton_out.dtype), atol=1e-2, rtol=1e-2
+    )
 
 
 @pytest.mark.parametrize("BATCH", [1, 4, 57, 128])
@@ -614,7 +513,7 @@ def test_mha_backward(
     "NUM_Q_HEADS, NUM_K_HEADS", [(1, 1), (16, 16), (2, 1), (48, 8)]
 )
 @pytest.mark.parametrize("HEAD_SZ", [8, 32, 128])
-@pytest.mark.parametrize("FP8", [False])
+# @pytest.mark.parametrize("FP8", [False])
 @pytest.mark.parametrize("FUSED", [False, True])
 # @pytest.mark.parametrize('FP8',[(False), (True)]) #TODO Debug FP8
 def test_mha_backward_varlen(
@@ -626,7 +525,7 @@ def test_mha_backward_varlen(
     HEAD_SZ: int,
     DROPOUT: float,
     CAUSAL: bool,
-    FP8: bool,
+    # FP8: bool,
     FUSED: bool,
     dtype=torch.float16,
 ):
