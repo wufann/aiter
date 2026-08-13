@@ -86,6 +86,8 @@ def fp8_mqa_logits(
     cu_starts,
     cu_ends,
     clean_logits=True,
+    out=None,
+    logits_col_zero=False,
 ):
     """
     This function computes the logits to be used by a topk function for sparse attention.
@@ -113,7 +115,12 @@ def fp8_mqa_logits(
     # Initialize with -inf because of causal masking
     aligned_size = 256
     seq_len_kv_aligned = (seq_len_kv + aligned_size - 1) // aligned_size * aligned_size
-    if clean_logits:
+    if out is not None:
+        # Caller-provided output. In the batched/column-0-aligned mode the
+        # output width is max_seg_len (not seq_len_kv), and the caller is
+        # responsible for pre-filling invalid positions with -inf.
+        logits = out
+    elif clean_logits:
         logits = torch.full(
             (seq_len, seq_len_kv_aligned),
             fill_value=-float("inf"),
@@ -132,6 +139,10 @@ def fp8_mqa_logits(
     stride_kv_s, stride_kv_d = KV.stride()
     stride_w_s, stride_w_h = weights.stride()
     stride_logits_s, stride_logits_k = logits.stride()
+    if logits_col_zero and not use_gluon:
+        raise NotImplementedError(
+            "logits_col_zero is only supported on the gluon (gfx950/gfx1250) path."
+        )
     if not use_gluon:
         # On gfx942 (MI300X), drop to (64, 1) when our LDS estimate predicts
         # the default (128, 2) tile would not fit two co-resident workgroups
@@ -203,8 +214,15 @@ def fp8_mqa_logits(
             num_chains = 4 if USE_FOLDED_REDUCTION else 0
             num_warps = 1
             block_kv = 32
-            other = {"USE_PADDED_SHARED_LAYOUT": ASYNC_COPY_SUPPORTS_DISTRIBUTED}
+            other = {
+                "USE_PADDED_SHARED_LAYOUT": ASYNC_COPY_SUPPORTS_DISTRIBUTED,
+                "LOGITS_COL_ZERO": logits_col_zero,
+            }
         else:
+            if logits_col_zero:
+                raise NotImplementedError(
+                    "logits_col_zero is only supported on the gfx950 gluon kernel."
+                )
             loop_variant = 1
             waves_per_eu = 1
             num_chains = 8 if USE_FOLDED_REDUCTION else 0
